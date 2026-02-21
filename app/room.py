@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import time
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -20,7 +21,11 @@ from app.models import (
     RoomCreatedMsg,
     StateSyncMsg,
     StonePlacedMsg,
+    TurnTimerMsg,
 )
+
+TURN_TIMEOUT = 30  # seconds
+TIMER_INTERVAL = 5  # seconds between turn_timer pushes
 
 
 @dataclass
@@ -38,7 +43,15 @@ class Room:
     game: GameState = field(default_factory=GameState)
     game_started: bool = False
     turn_timer_task: asyncio.Task | None = field(default=None, repr=False)
+    turn_timer_start: float = 0.0
     disconnect_tasks: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
+
+    @property
+    def timer_remaining(self) -> float:
+        if self.turn_timer_start == 0.0:
+            return float(TURN_TIMEOUT)
+        elapsed = time.monotonic() - self.turn_timer_start
+        return max(TURN_TIMEOUT - elapsed, 0.0)
 
     def get_player_by_token(self, token: str) -> Player | None:
         for p in self.players:
@@ -132,6 +145,9 @@ class RoomManager:
         for p in room.players:
             await room.send_to(p, GameStartedMsg(your_color=p.color).model_dump())
 
+        # Start turn timer for black's first move
+        self._start_turn_timer(room)
+
         return room
 
     async def place_stone(self, ws: WebSocket, row: int, col: int):
@@ -171,9 +187,12 @@ class RoomManager:
             await room.broadcast(
                 GameOverMsg(winner=room.game.winner, reason=reason).model_dump()
             )
-            # Cancel turn timer if active
+            # Cancel turn timer
             if room.turn_timer_task and not room.turn_timer_task.done():
                 room.turn_timer_task.cancel()
+        else:
+            # Restart timer for next player's turn
+            self._start_turn_timer(room)
 
     async def reconnect(self, ws: WebSocket, room_id: str, player_token: str):
         room = self.rooms.get(room_id)
@@ -204,7 +223,7 @@ class RoomManager:
                 current_turn=room.game.current_turn,
                 move_count=room.game.move_count,
                 your_color=player.color,
-                timer_remaining=30.0,
+                timer_remaining=room.timer_remaining,
             ).model_dump(),
         )
 
@@ -258,6 +277,34 @@ class RoomManager:
         for task in room.disconnect_tasks.values():
             if not task.done():
                 task.cancel()
+
+    def _start_turn_timer(self, room: Room):
+        """Cancel existing timer and start a new 30-second countdown."""
+        if room.turn_timer_task and not room.turn_timer_task.done():
+            room.turn_timer_task.cancel()
+        room.turn_timer_start = time.monotonic()
+
+        async def timer_loop():
+            remaining = float(TURN_TIMEOUT)
+            while remaining > 0:
+                await asyncio.sleep(min(TIMER_INTERVAL, remaining))
+                remaining -= TIMER_INTERVAL
+                if room.game.is_game_over:
+                    return
+                clamped = max(remaining, 0.0)
+                await room.broadcast(TurnTimerMsg(remaining=clamped).model_dump())
+
+            # Timeout — current player loses
+            if not room.game.is_game_over:
+                loser_color = room.game.current_turn
+                winner_color = "white" if loser_color == "black" else "black"
+                room.game.is_game_over = True
+                room.game.winner = winner_color
+                await room.broadcast(
+                    GameOverMsg(winner=winner_color, reason="timeout").model_dump()
+                )
+
+        room.turn_timer_task = asyncio.create_task(timer_loop())
 
     def get_room_for_ws(self, ws: WebSocket) -> Room | None:
         room_id = self._ws_to_room.get(ws)
