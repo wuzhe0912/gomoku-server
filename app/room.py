@@ -9,15 +9,16 @@ from uuid import uuid4
 
 from fastapi import WebSocket
 
+from app.game import GameState
 from app.models import (
     ErrorMsg,
+    GameOverMsg,
     GameStartedMsg,
     OpponentDisconnectedMsg,
     PlayerJoinedMsg,
     RoomCreatedMsg,
+    StonePlacedMsg,
 )
-
-BOARD_SIZE = 15
 
 
 @dataclass
@@ -32,22 +33,15 @@ class Player:
 class Room:
     room_id: str
     players: list[Player] = field(default_factory=list)
-    board: list[list[str | None]] = field(default_factory=list)
-    current_turn: str = "black"
-    move_count: int = 0
-    is_game_over: bool = False
-    winner: str | None = None
+    game: GameState = field(default_factory=GameState)
     game_started: bool = False
     turn_timer_task: asyncio.Task | None = field(default=None, repr=False)
     disconnect_tasks: dict[str, asyncio.Task] = field(default_factory=dict, repr=False)
 
-    def __post_init__(self):
-        if not self.board:
-            self.board = [[None] * BOARD_SIZE for _ in range(BOARD_SIZE)]
-
     def get_player_by_token(self, token: str) -> Player | None:
         for p in self.players:
-            return p if p.token == token else None
+            if p.token == token:
+                return p
         return None
 
     def get_player_by_ws(self, ws: WebSocket) -> Player | None:
@@ -113,7 +107,7 @@ class RoomManager:
         if len(room.players) >= 2:
             await ws.send_json(ErrorMsg(message="Room is full").model_dump())
             return None
-        if room.is_game_over:
+        if room.game.is_game_over:
             await ws.send_json(ErrorMsg(message="Game already ended").model_dump())
             return None
 
@@ -138,6 +132,47 @@ class RoomManager:
 
         return room
 
+    async def place_stone(self, ws: WebSocket, row: int, col: int):
+        room = self.get_room_for_ws(ws)
+        if room is None:
+            await ws.send_json(ErrorMsg(message="Not in a room").model_dump())
+            return
+        if not room.game_started:
+            await ws.send_json(ErrorMsg(message="Game not started yet").model_dump())
+            return
+
+        player = room.get_player_by_ws(ws)
+        if player is None:
+            return
+
+        error = room.game.validate_move(row, col, player.color)
+        if error:
+            await ws.send_json(ErrorMsg(message=error).model_dump())
+            return
+
+        game_ended = room.game.place_stone(row, col, player.color)
+
+        if game_ended:
+            next_turn = None
+        else:
+            next_turn = room.game.current_turn
+
+        await room.broadcast(
+            StonePlacedMsg(row=row, col=col, color=player.color, next_turn=next_turn).model_dump()
+        )
+
+        if game_ended:
+            if room.game.winner:
+                reason = "five_in_row"
+            else:
+                reason = "draw"
+            await room.broadcast(
+                GameOverMsg(winner=room.game.winner, reason=reason).model_dump()
+            )
+            # Cancel turn timer if active
+            if room.turn_timer_task and not room.turn_timer_task.done():
+                room.turn_timer_task.cancel()
+
     async def handle_disconnect(self, ws: WebSocket):
         room_id = self._ws_to_room.pop(ws, None)
         if room_id is None:
@@ -160,12 +195,10 @@ class RoomManager:
             # Schedule room cleanup after 60 seconds if player doesn't reconnect
             async def cleanup_after_timeout():
                 await asyncio.sleep(60)
-                # If still disconnected, forfeit
                 if not player.connected:
-                    if not room.is_game_over and room.game_started:
-                        from app.models import GameOverMsg
-                        room.is_game_over = True
-                        room.winner = opponent.color
+                    if not room.game.is_game_over and room.game_started:
+                        room.game.is_game_over = True
+                        room.game.winner = opponent.color
                         await room.broadcast(
                             GameOverMsg(winner=opponent.color, reason="disconnect").model_dump()
                         )
@@ -174,7 +207,6 @@ class RoomManager:
             task = asyncio.create_task(cleanup_after_timeout())
             room.disconnect_tasks[player.token] = task
         else:
-            # No opponent or opponent also disconnected — clean up immediately
             self._cleanup_room(room_id)
 
     def _cleanup_room(self, room_id: str):

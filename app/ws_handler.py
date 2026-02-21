@@ -7,6 +7,7 @@ from app.models import (
     ErrorMsg,
     JoinRoomMsg,
     LeaveRoomMsg,
+    PlaceStoneMsg,
     parse_client_message,
 )
 from app.room import room_manager
@@ -30,6 +31,9 @@ async def websocket_endpoint(ws: WebSocket):
 
             elif isinstance(msg, JoinRoomMsg):
                 await room_manager.join_room(ws, msg.room_id)
+
+            elif isinstance(msg, PlaceStoneMsg):
+                await room_manager.place_stone(ws, msg.row, msg.col)
 
             elif isinstance(msg, LeaveRoomMsg):
                 await room_manager.handle_disconnect(ws)
