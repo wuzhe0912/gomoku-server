@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/code
+    command: uvicorn app.main:app --host 0.0.0.0 --reload
+    environment:
+      - CORS_ORIGINS=http://localhost:5173,http://localhost:5174
