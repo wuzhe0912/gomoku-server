@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.ws_handler import router as ws_router
+
 load_dotenv()
 
 app = FastAPI(title="Gomoku Server")
@@ -16,6 +18,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.include_router(ws_router)
 
 
 @app.get("/health")
