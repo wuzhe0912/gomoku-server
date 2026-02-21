@@ -15,8 +15,10 @@ from app.models import (
     GameOverMsg,
     GameStartedMsg,
     OpponentDisconnectedMsg,
+    OpponentReconnectedMsg,
     PlayerJoinedMsg,
     RoomCreatedMsg,
+    StateSyncMsg,
     StonePlacedMsg,
 )
 
@@ -172,6 +174,44 @@ class RoomManager:
             # Cancel turn timer if active
             if room.turn_timer_task and not room.turn_timer_task.done():
                 room.turn_timer_task.cancel()
+
+    async def reconnect(self, ws: WebSocket, room_id: str, player_token: str):
+        room = self.rooms.get(room_id)
+        if room is None:
+            await ws.send_json(ErrorMsg(message="Room not found").model_dump())
+            return
+
+        player = room.get_player_by_token(player_token)
+        if player is None:
+            await ws.send_json(ErrorMsg(message="Invalid player token").model_dump())
+            return
+
+        # Cancel the disconnect timeout task
+        disconnect_task = room.disconnect_tasks.pop(player_token, None)
+        if disconnect_task and not disconnect_task.done():
+            disconnect_task.cancel()
+
+        # Replace the WebSocket connection
+        player.ws = ws
+        player.connected = True
+        self._ws_to_room[ws] = room_id
+
+        # Send full state sync to the reconnecting player
+        await room.send_to(
+            player,
+            StateSyncMsg(
+                board=room.game.board,
+                current_turn=room.game.current_turn,
+                move_count=room.game.move_count,
+                your_color=player.color,
+                timer_remaining=30.0,
+            ).model_dump(),
+        )
+
+        # Notify opponent
+        opponent = room.get_opponent(player)
+        if opponent and opponent.connected:
+            await room.send_to(opponent, OpponentReconnectedMsg().model_dump())
 
     async def handle_disconnect(self, ws: WebSocket):
         room_id = self._ws_to_room.pop(ws, None)
